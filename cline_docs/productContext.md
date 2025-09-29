@@ -1,25 +1,21 @@
-# Product Context
+# Letta Proxy - Product Context
 
-## Why this project exists
-This project provides a bridge between AI applications that support the OpenAI Chat Completions API and Letta agents. It allows any OpenAI-compatible client to communicate with Letta's stateful agents without requiring custom integration code.
+## Why This Project Exists
 
-## What problems it solves
-1. **API Compatibility**: Many AI applications and frameworks only support OpenAI's chat completions API format
-2. **Agent Integration**: Provides seamless access to Letta's stateful agents through a familiar interface
-3. **Developer Experience**: Reduces friction when integrating Letta agents into existing AI workflows
-4. **Tool Calling Support**: Enables function calling capabilities between OpenAI clients and Letta agents
+The Letta Proxy Server provides an OpenAI-compatible API interface for Letta agents, enabling seamless integration with existing OpenAI-based applications while leveraging Letta's advanced memory and tool capabilities. This allows users to use Letta agents with applications like Open WebUI without modifying the client applications.
 
-## How it should work
-1. **API Translation**: The proxy receives OpenAI-formatted requests and translates them to Letta API calls
-2. **Agent Mapping**: Maps OpenAI "model" names to Letta agent IDs
-3. **Message Conversion**: Converts between OpenAI message formats and Letta message formats
-4. **Response Formatting**: Translates Letta responses back to OpenAI-compatible responses
-5. **Streaming Support**: Maintains streaming functionality for real-time interactions
-6. **Tool Calling**: Handles function calling between the OpenAI client and Letta agents
+## Problems It Solves
 
-## Key Features
-- `POST /v1/chat/completions` - OpenAI-compatible chat completion endpoint
-- `GET /v1/models` - Lists Letta agents as OpenAI models
-- Support for streaming responses
-- Tool calling integration
-- Async/await support for performance
+1. **Compatibility Gap**: OpenAI-based applications cannot directly use Letta agents due to API differences
+2. **Memory Management**: Provides system prompt overlay management through Letta memory blocks for unlimited prompt lengths
+3. **Tool Integration**: Synchronizes and executes tools between OpenAI-compatible clients and Letta agents
+4. **Streaming Support**: Enables real-time streaming responses compatible with OpenAI's API format
+
+## How It Should Work
+
+1. **Agent Discovery**: Automatically discover available Letta agents and present them as OpenAI models
+2. **Request Translation**: Convert OpenAI API requests to Letta agent interactions
+3. **Memory Management**: Apply system prompts via persistent Letta memory blocks
+4. **Tool Handling**: Process tool definitions and tool call results
+5. **Response Streaming**: Provide OpenAI-compatible streaming responses
+6. **Error Handling**: Comprehensive error handling with graceful fallbacks

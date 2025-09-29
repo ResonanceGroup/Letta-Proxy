@@ -17,6 +17,7 @@ Environment Variables (set in .env file):
     LETTA_API_KEY: API key for Letta authentication (required for Letta Cloud)
     LETTA_PROJECT: Project name for Letta Cloud (default: default-project)
     PROXY_DEBUG_SESSIONS: Enable debug endpoint for session inspection (default: disabled)
+    DEBUG_RAW_OUTPUT: Write raw response text to debug file for analysis (default: false)
 
 Author: Jason Owens
 Version: 1.0.0
@@ -44,10 +45,22 @@ from letta_client.types import (
 
 from proxy_tool_bridge import ProxyToolBridge, initialize_proxy_bridge, get_proxy_bridge
 from proxy_overlay import ProxyOverlayManager
+from streaming_models import (
+    StreamingChunk,
+    Delta,
+    Choice,
+    create_streaming_chunk,
+    create_error_chunk,
+    unescape_content
+)
+from streaming_content_processor import process_streaming_chunk, cleanup_streaming_session
 
 # Configuration from environment variables
 LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
+# Force DEBUG_RAW_OUTPUT to true for now to diagnose newline issues
+DEBUG_RAW_OUTPUT = True  # os.getenv("DEBUG_RAW_OUTPUT", "false").lower() == "true"
+DEBUG_OUTPUT_FILE = "letta_proxy_debug.txt"
 
 # Configure logging
 logging.basicConfig(
@@ -74,6 +87,28 @@ class AgentDescriptor:
 
 agent_map: Dict[str, AgentDescriptor] = {}
 overlay_manager: Optional[ProxyOverlayManager] = None
+
+
+def write_debug_output(content: str, stage: str = "RESPONSE") -> None:
+    """Write debug content to file if DEBUG_RAW_OUTPUT is enabled.
+    
+    Args:
+        content: The content to write to the debug file
+        stage: A label describing what stage this content represents
+    """
+    if not DEBUG_RAW_OUTPUT:
+        return
+    
+    try:
+        import datetime
+        timestamp = datetime.datetime.now().isoformat()
+        debug_entry = f"\n{'='*60}\n[{timestamp}] {stage}\n{'='*60}\n{content}\n"
+        
+        with open(DEBUG_OUTPUT_FILE, "a", encoding="utf-8") as f:
+            f.write(debug_entry)
+    except Exception as e:
+        logger.warning(f"Failed to write debug output: {e}")
+
 
 
 class ChatCompletionRequest(BaseModel):
@@ -241,6 +276,7 @@ async def startup_event() -> None:
     print(f"URL scheme: {LETTA_BASE_URL.split('://')[0] if '://' in LETTA_BASE_URL else 'No scheme'}")
 
 
+    # Add timeout configuration to prevent ReadTimeout errors
     client = AsyncLetta(**client_kwargs)
 
     try:
@@ -261,6 +297,13 @@ async def startup_event() -> None:
     if agent_map:
         initialize_proxy_bridge(client)
         logger.info("Proxy tool bridge initialized successfully.")
+    
+    # Log debug mode status
+    if DEBUG_RAW_OUTPUT:
+        logger.info(f"DEBUG_RAW_OUTPUT enabled - responses will be logged to {DEBUG_OUTPUT_FILE}")
+        write_debug_output("=== LETTA PROXY DEBUG SESSION STARTED ===", "STARTUP")
+    else:
+        logger.info("DEBUG_RAW_OUTPUT disabled - no response logging")
 
 
 @app.get("/v1/models")
@@ -380,6 +423,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     if not body.messages:
         raise HTTPException(status_code=400, detail="messages required")
     
+    # Debug: Log the incoming request
+    if DEBUG_RAW_OUTPUT:
+        write_debug_output(f"INCOMING REQUEST:\nModel: {body.model}\nStream: {body.stream}\nMessages: {json.dumps(body.messages, ensure_ascii=False, indent=2)}", "REQUEST")
+    
     system_content = _collect_system_content(body.messages)
 
     if overlay_manager is None:
@@ -458,8 +505,18 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                     {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
                 ],
             }
-            yield f"data: {json.dumps(primer, ensure_ascii=False)}\n\n"
+            # Fix: Preserve actual newlines in primer message content
+            # Use Pydantic model for consistent JSON formatting
+            primer_chunk = create_streaming_chunk(
+                stream_id=primer["id"],
+                model=primer["model"],
+                content="",
+                finish_reason=None
+            )
+            yield f"data: {primer_chunk.model_dump_json()}\n\n"
             yield "data: [DONE]\n\n"
+            # Cleanup session state for empty stream
+            cleanup_streaming_session(session_id)
 
         return StreamingResponse(
             empty_stream(),
@@ -472,176 +529,143 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         )
 
     if body.stream:
-        async def event_stream():
-            assert client is not None
-            # Keep one id for the entire stream (OpenAI behavior)
-            stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+        # EXACT implementation like reference
+        resp_id = f"chatcmpl-{uuid.uuid4()}"  # OpenAI compatible ID
+
+        async def stream_chunks():
+            """Convert Letta streaming events to string chunks like reference implementation"""
             try:
-                # Optional: primer delta with assistant role (improves client compatibility)
-                primer = {
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": body.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                        "finish_reason": None
-                    }]
-                }
-                yield f"data: {json.dumps(primer, ensure_ascii=False)}\n\n"
-                
                 async for event in client.agents.messages.create_stream(
                     agent_id=agent_id,
                     messages=outbound_messages,
                     stream_tokens=True
                 ):
-                    # Build chunk from event
-                    if hasattr(event, 'message_type') and event.message_type == 'reasoning_message':
-                        chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": body.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": None,
-                                        "reasoning": event.reasoning
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-
-                    elif hasattr(event, 'message_type') and event.message_type == 'assistant_message':
-                        chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": body.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": event.content,
-                                        "reasoning": None
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-
-                    elif hasattr(event, 'message_type') and event.message_type == 'tool_call_message':
-                        chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": body.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": 0,
-                                                "id": event.tool_call.tool_call_id,
-                                                "type": "function",
-                                                "function": {
-                                                    "name": event.tool_call.name,
-                                                    "arguments": event.tool_call.arguments,
-                                                },
-                                            }
-                                        ],
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-
-                    elif hasattr(event, 'message_type') and event.message_type == 'stop_reason':
-                        chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": body.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": event.stop_reason,
-                                }
-                            ],
-                        }
-
-                    # Legacy handling for events without message_type
-                    elif isinstance(event, ToolCallMessage):
-                        chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": body.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": 0,
-                                                "id": event.tool_call.tool_call_id,
-                                                "type": "function",
-                                                "function": {
-                                                    "name": event.tool_call.name,
-                                                    "arguments": event.tool_call.arguments,
-                                                },
-                                            }
-                                        ],
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-
-                    elif isinstance(event, AssistantMessage):
-                        chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": body.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": event.content,
-                                        "reasoning": None
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-
-                    else:
-                        # Skip unknown event types
+                    # Handle tool calls - preserve our tool functionality
+                    if hasattr(event, 'message_type') and event.message_type == 'tool_call_message':
+                        chunk_resp = StreamingChunk(
+                            id=resp_id,
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=body.model,
+                            choices=[Choice(
+                                index=0,
+                                delta=Delta(
+                                    content="",
+                                    tool_calls=[{
+                                        "index": 0,
+                                        "id": event.tool_call.tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": event.tool_call.name,
+                                            "arguments": event.tool_call.arguments,
+                                        },
+                                    }]
+                                )
+                            )]
+                        )
+                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
                         continue
+                    elif isinstance(event, ToolCallMessage):
+                        chunk_resp = StreamingChunk(
+                            id=resp_id,
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=body.model,
+                            choices=[Choice(
+                                index=0,
+                                delta=Delta(
+                                    content="",
+                                    tool_calls=[{
+                                        "index": 0,
+                                        "id": event.tool_call.tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": event.tool_call.name,
+                                            "arguments": event.tool_call.arguments,
+                                        },
+                                    }]
+                                )
+                            )]
+                        )
+                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
+                        continue
+                        
+                    # Extract content from various event types - convert to simple strings
+                    chunk_content = ""
+                    if hasattr(event, 'message_type') and event.message_type == 'assistant_message':
+                        chunk_content = event.content or ""
+                        if DEBUG_RAW_OUTPUT:
+                            write_debug_output(f"RAW LETTA CONTENT: {repr(chunk_content)}", "LETTA_RAW")
+                            write_debug_output(f"AFTER UNESCAPE: {repr(unescape_content(chunk_content))}", "AFTER_UNESCAPE")
+                        # Use stateful processor for streaming-aware newline reconstruction
+                        chunk_content = process_streaming_chunk(session_id, chunk_content)
+                    elif isinstance(event, AssistantMessage):
+                        chunk_content = event.content or ""
+                        if DEBUG_RAW_OUTPUT:
+                            write_debug_output(f"RAW LETTA CONTENT (legacy): {repr(chunk_content)}", "LETTA_RAW_LEGACY")
+                        # Use stateful processor for streaming-aware newline reconstruction
+                        chunk_content = process_streaming_chunk(session_id, chunk_content)
+                    elif hasattr(event, 'message_type') and event.message_type == 'reasoning_message':
+                        # Skip reasoning or include it - up to you
+                        continue
+                    elif hasattr(event, 'message_type') and event.message_type == 'stop_reason':
+                        # Send final chunk
+                        final_chunk = StreamingChunk(
+                            id=resp_id,
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=body.model,
+                            choices=[Choice(index=0, delta=Delta(content=""), finish_reason=event.stop_reason)]
+                        )
+                        yield f"data: {final_chunk.model_dump_json()}\n\n"
+                        return
+                    else:
+                        continue
+                        
+                    # Only process non-empty content - EXACT reference implementation
+                    if chunk_content:
+                        if not isinstance(chunk_content, str):
+                            logger.warning(f"Letta returned non-string chunk: {type(chunk_content)}. Converting to str.")
+                            chunk_content = str(chunk_content)
 
-                    # Yield the chunk immediately for real-time streaming (preserve raw '<' '>')
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        chunk_resp = StreamingChunk(
+                            id=resp_id,
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=body.model,
+                            choices=[Choice(index=0, delta=Delta(content=chunk_content))]
+                        )
+                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
 
+                # Send final chunk if not already sent
+                final_chunk = StreamingChunk(
+                    id=resp_id,
+                    object="chat.completion.chunk",
+                    created=int(time.time()),
+                    model=body.model,
+                    choices=[Choice(index=0, delta=Delta(content=""), finish_reason="stop")]
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
+                
             except Exception as e:
-                logger.error(f"Streaming error: {e}")
-                error_chunk = {
-                    "id": stream_id,
-                    "object": "error",
-                    "error": {
-                        "message": f"Streaming error: {str(e)}",
-                        "type": "streaming_error"
-                    }
-                }
-                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                logger.error(f"Error during streaming: {e}", exc_info=True)
+                error_chunk_content = f"Error processing stream: {e}"
+                error_resp = StreamingChunk(
+                    id=resp_id,
+                    object="chat.completion.chunk",
+                    created=int(time.time()),
+                    model=body.model,
+                    choices=[Choice(index=0, delta=Delta(content=error_chunk_content), finish_reason="stop")]
+                )
+                yield f"data: {error_resp.model_dump_json()}\n\n"
 
-            # Send final DONE message
+        async def event_stream():
+            assert client is not None
+            async for chunk in stream_chunks():
+                yield chunk
             yield "data: [DONE]\n\n"
+            # Cleanup session state after streaming completes
+            cleanup_streaming_session(session_id)
 
         return StreamingResponse(
             event_stream(),
@@ -653,7 +677,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
             }
         )
 
-    assert client is not None
     assert client is not None
 
     if not outbound_messages:
@@ -712,9 +735,18 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         combined_content = ""
         for msg in assistant_messages:
             if msg.content:
+                # Debug: Log each individual message content
+                if DEBUG_RAW_OUTPUT:
+                    write_debug_output(f"RAW ASSISTANT MESSAGE: {repr(msg.content)}", "NON_STREAMING_ASSISTANT")
+                
+                # For non-streaming responses, we can use the old unescape_content since there's no chunking
+                text = unescape_content(msg.content or "")
+                if DEBUG_RAW_OUTPUT:
+                    write_debug_output(f"NON-STREAMING RAW CONTENT: {repr(msg.content or '')}", "NON_STREAMING_RAW")
+                    write_debug_output(f"NON-STREAMING AFTER UNESCAPE: {repr(text)}", "NON_STREAMING_UNESCAPED")
                 if combined_content:
                     combined_content += "\n\n"
-                combined_content += msg.content
+                combined_content += text
         
         # Include reasoning from the first message that has it
         reasoning_content = ""
@@ -734,6 +766,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                 response_message["content"] = f"{combined_content}\n\n[Reasoning: {reasoning_content}]"
             else:
                 response_message["content"] = reasoning_content
+        
+        # Debug: Log the final combined content
+        if DEBUG_RAW_OUTPUT:
+            write_debug_output(f"FINAL COMBINED CONTENT: {repr(response_message['content'])}", "NON_STREAMING_FINAL")
 
     usage = resp.usage
     openai_resp = {
@@ -754,5 +790,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
             "total_tokens": usage.total_tokens,
         },
     }
+    
+    # Debug: Log the complete response being sent to client
+    if DEBUG_RAW_OUTPUT:
+        write_debug_output(f"COMPLETE NON-STREAMING RESPONSE: {json.dumps(openai_resp, ensure_ascii=False, indent=2)}", "NON_STREAMING_OUTPUT")
+    
     # Preserve raw "<" and ">" in non-stream JSON too
     return Response(content=json.dumps(openai_resp, ensure_ascii=False), media_type="application/json")

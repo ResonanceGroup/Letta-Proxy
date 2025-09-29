@@ -56,3 +56,95 @@ curl -N -X POST http://localhost:8000/v1/chat/completions \
 - Streaming support for real-time responses
 - Connection pooling through HTTP client
 - Efficient message format conversion
+
+## Current Debugging Session - Technical Implementation
+
+### 🎯 **Newline Handling Implementation**
+
+#### **Core Challenge**
+Open WebUI displays literal `\n` characters instead of line breaks in markdown tables when using streaming responses.
+
+#### **Root Cause**
+JSON serialization converts actual newlines (`\n`) to escaped newlines (`\\n`) in JSON strings, breaking markdown rendering.
+
+#### **Technical Solution**
+
+**Pydantic Model Approach**:
+```python
+from pydantic import BaseModel
+
+class Delta(BaseModel):
+    content: str
+    reasoning: None
+
+class Choice(BaseModel):
+    index: int
+    delta: Delta
+    logprobs: None
+    finish_reason: None
+
+class StreamingChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[Choice]
+
+# Usage
+chunk = StreamingChunk(...)
+yield f"data: {chunk.model_dump_json()}\n\n"
+```
+
+**Content Processing**:
+```python
+def unescape_content(content: str) -> str:
+    \"\"\"Convert Letta's double-escaped newlines to actual newlines\"\"\"
+    if not content:
+        return content
+    return content.replace('\\n', '\n')  # \\n → \n
+```
+
+#### **Data Flow**
+1. **Letta Agent** → sends `\\n` (escaped newlines)
+2. **`unescape_content()`** → converts `\\n` → `\n` (correct)
+3. **Pydantic Model** → preserves actual newlines in content field
+4. **`model_dump_json()`** → clean JSON with proper newlines
+5. **Open WebUI** → receives actual newlines for proper markdown rendering
+
+#### **Key Technical Decisions**
+
+1. **✅ Pydantic Models**: Replaced manual JSON dicts with typed models
+2. **✅ Model JSON Serialization**: Used `model_dump_json()` instead of `json.dumps()`
+3. **✅ Content Unescaping**: Preserved `unescape_content()` function (it was correct)
+4. **✅ Simplified Approach**: Removed complex regex post-processing
+5. **❌ Error Handling Bug**: Missing function reference causing crashes
+
+#### **Current Status**
+- **✅ Core Implementation**: Pydantic model approach working correctly
+- **✅ Multiple Locations**: Applied to all streaming JSON serialization points
+- **❌ Critical Bug**: `NameError` in error handling section
+- **❌ Stream Termination**: Still terminates after first character
+
+#### **Debugging Infrastructure**
+- **Enhanced Logging**: Clean debug output with `RAW_DELTA_CONTENT` entries
+- **Pipeline Tracing**: Complete visibility into data transformation steps
+- **Error Analysis**: Detailed error logging and stack traces
+- **Comparative Analysis**: Working implementation reference for validation
+
+#### **Technical Debt Identified**
+- **Function Management**: Poor function lifecycle management leading to missing references
+- **Error Handling**: Insufficient error boundary management
+- **Testing**: Limited testing of error conditions and edge cases
+- **Complexity**: Over-engineering with regex-based solutions
+
+#### **Next Steps**
+1. **Fix Missing Function**: Add missing `fix_json_newlines()` or update error handling
+2. **Root Cause Investigation**: Determine why streaming terminates early
+3. **Alternative Implementation**: Consider adopting wsargent/letta-openai-proxy pattern
+4. **Final Testing**: Verify complete solution works end-to-end
+5. **Documentation**: Update technical documentation with solution details
+
+#### **Risk Assessment**
+- **High Risk**: Current implementation crashes on errors
+- **Medium Risk**: Streaming reliability issues affecting user experience
+- **Low Risk**: Core functionality works (non-streaming mode operational)
