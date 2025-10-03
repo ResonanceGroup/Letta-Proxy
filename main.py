@@ -16,6 +16,7 @@ Environment Variables (set in .env file):
     LETTA_BASE_URL: Base URL for the Letta server (default: http://localhost:8283)
     LETTA_API_KEY: API key for Letta authentication (required for Letta Cloud)
     LETTA_PROJECT: Project name for Letta Cloud (default: default-project)
+    REMOVE_SYSTEM_PROMPT: When set to 'true', omit system prompts from data sent to Letta agent (default: false)
     PROXY_DEBUG_SESSIONS: Enable debug endpoint for session inspection (default: disabled)
     DEBUG_RAW_OUTPUT: Write raw response text to debug file for analysis (default: false)
 
@@ -31,6 +32,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
@@ -55,11 +57,15 @@ from streaming_models import (
 )
 from streaming_content_processor import process_streaming_chunk, cleanup_streaming_session
 
+# Load environment variables from .env file
+load_dotenv()
+
 # Configuration from environment variables
 LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
+REMOVE_SYSTEM_PROMPT = os.getenv("REMOVE_SYSTEM_PROMPT", "false").lower() == "true"
 # Force DEBUG_RAW_OUTPUT to true for now to diagnose newline issues
-DEBUG_RAW_OUTPUT = True  # os.getenv("DEBUG_RAW_OUTPUT", "false").lower() == "true"
+DEBUG_RAW_OUTPUT = os.getenv("DEBUG_RAW_OUTPUT", "false").lower() == "true"
 DEBUG_OUTPUT_FILE = "letta_proxy_debug.txt"
 
 # Configure logging
@@ -426,8 +432,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     # Debug: Log the incoming request
     if DEBUG_RAW_OUTPUT:
         write_debug_output(f"INCOMING REQUEST:\nModel: {body.model}\nStream: {body.stream}\nMessages: {json.dumps(body.messages, ensure_ascii=False, indent=2)}", "REQUEST")
-    
+
     system_content = _collect_system_content(body.messages)
+    if REMOVE_SYSTEM_PROMPT:
+        system_content = None
 
     if overlay_manager is None:
         raise HTTPException(status_code=500, detail="Overlay manager unavailable")

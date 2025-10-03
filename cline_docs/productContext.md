@@ -17,5 +17,5 @@ The Letta Proxy Server provides an OpenAI-compatible API interface for Letta age
 2. **Request Translation**: Convert OpenAI API requests to Letta agent interactions
 3. **Memory Management**: Apply system prompts via persistent Letta memory blocks
 4. **Tool Handling**: Process tool definitions and tool call results
-5. **Response Streaming**: Provide OpenAI-compatible streaming responses
+5. **Response Streaming**: Provide OpenAI-compatible streaming responses with proper markdown rendering (including tables, formatting, and newlines)
 6. **Error Handling**: Comprehensive error handling with graceful fallbacks
