@@ -24,7 +24,7 @@ A FastAPI server that provides an OpenAI-compatible API interface for [Letta](ht
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/ResonanceGroup/Letta-Proxy.git
 cd Letta-Proxy
 
 # Install dependencies
