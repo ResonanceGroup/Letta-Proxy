@@ -1,6 +1,6 @@
 # Letta OpenAI Proxy
 
-A production-ready FastAPI server that provides an OpenAI-compatible API interface for [Letta](https://docs.letta.com/) V1 agents, enabling seamless integration with existing OpenAI-based applications while leveraging Letta's advanced memory and tool capabilities.
+A FastAPI server that provides an OpenAI-compatible API interface for [Letta](https://docs.letta.com/) V1 agents, enabling seamless integration with existing OpenAI-based applications while leveraging Letta's advanced memory and tool capabilities.
 
 ## ✨ Features
 
