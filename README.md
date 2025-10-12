@@ -40,31 +40,19 @@ Create a `.env` file in the project root:
 cp env.example .env
 ```
 
-Edit `.env` with your Letta server details:
-
-```env
-# For Letta V1 Cloud
-LETTA_BASE_URL=https://api.letta.com
-LETTA_API_KEY=your-letta-api-key-here
-LETTA_PROJECT=your-project-name
-
-# For Local Letta V1 Server
-LETTA_BASE_URL=http://localhost:8283
-# LETTA_API_KEY is optional for local servers
-
-# Optional Settings
-REMOVE_SYSTEM_PROMPT=false
-DEBUG_RAW_OUTPUT=false
-```
+Edit `.env` with your settings (see [Configuration](#🛠️-configuration) section for details).
 
 ### Running the Server
 
 ```bash
-# Start the server
+# Option 1: Run directly with Python (uses environment variables)
+python main.py
+
+# Option 2: Run with uvicorn (manual host/port configuration)
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 # The server will be available at:
-# http://localhost:8000
+# http://localhost:8000 (or your configured PROXY_HOST:PROXY_PORT)
 ```
 
 ## 📖 API Documentation
@@ -143,29 +131,40 @@ Returns server health status and configuration information.
 | `LETTA_BASE_URL` | Letta server URL | `http://localhost:8283` | Yes |
 | `LETTA_API_KEY` | Letta API key | - | For cloud/auth |
 | `LETTA_PROJECT` | Letta project name | `default-project` | For cloud |
+| `PROXY_HOST` | Proxy server bind address | `0.0.0.0` | No |
+| `PROXY_PORT` | Proxy server port | `8000` | No |
 | `REMOVE_SYSTEM_PROMPT` | Omit system prompts | `false` | No |
 | `DEBUG_RAW_OUTPUT` | Enable debug logging | `false` | No |
 | `PROXY_DEBUG_SESSIONS` | Enable session debugging | `0` | No |
 
 ### Server Types
 
-#### Letta V1 Cloud
+#### Example Configurations
+
+**Letta V1 Cloud:**
 ```env
 LETTA_BASE_URL=https://api.letta.com
 LETTA_API_KEY=sk-let-your-api-key-here
 LETTA_PROJECT=your-project-name
+PROXY_HOST=0.0.0.0
+PROXY_PORT=8000
 ```
 
-#### Local Letta V1 Server
+**Local Letta V1 Server:**
 ```env
 LETTA_BASE_URL=http://localhost:8283
+PROXY_HOST=127.0.0.1
+PROXY_PORT=8080
 # LETTA_API_KEY not required for local servers
 ```
 
-#### Custom Letta V1 Server
+**Custom Server with Debug:**
 ```env
 LETTA_BASE_URL=https://your-custom-letta-server.com
 LETTA_API_KEY=your-api-key-if-required
+PROXY_HOST=0.0.0.0
+PROXY_PORT=9000
+DEBUG_RAW_OUTPUT=true
 ```
 
 ## 🧪 Testing

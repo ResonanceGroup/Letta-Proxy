@@ -16,6 +16,8 @@ Environment Variables (set in .env file):
     LETTA_BASE_URL: Base URL for the Letta server (default: http://localhost:8283)
     LETTA_API_KEY: API key for Letta authentication (required for Letta Cloud)
     LETTA_PROJECT: Project name for Letta Cloud (default: default-project)
+    PROXY_HOST: IP address for the proxy server to bind to (default: 0.0.0.0)
+    PROXY_PORT: Port for the proxy server to listen on (default: 8000)
     REMOVE_SYSTEM_PROMPT: When set to 'true', omit system prompts from data sent to Letta agent (default: false)
     PROXY_DEBUG_SESSIONS: Enable debug endpoint for session inspection (default: disabled)
     DEBUG_RAW_OUTPUT: Write raw response text to debug file for analysis (default: false)
@@ -63,6 +65,8 @@ load_dotenv()
 # Configuration from environment variables
 LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
+PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
+PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
 REMOVE_SYSTEM_PROMPT = os.getenv("REMOVE_SYSTEM_PROMPT", "false").lower() == "true"
 DEBUG_RAW_OUTPUT = os.getenv("DEBUG_RAW_OUTPUT", "false").lower() == "true"
 DEBUG_OUTPUT_FILE = "letta_proxy_debug.txt"
@@ -804,3 +808,18 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     
     # Preserve raw "<" and ">" in non-stream JSON too
     return Response(content=json.dumps(openai_resp, ensure_ascii=False), media_type="application/json")
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    logger.info(f"Starting Letta Proxy Server on {PROXY_HOST}:{PROXY_PORT}")
+    logger.info(f"Connecting to Letta server at {LETTA_BASE_URL}")
+    
+    uvicorn.run(
+        app,
+        host=PROXY_HOST,
+        port=PROXY_PORT,
+        log_level="info"
+    )
