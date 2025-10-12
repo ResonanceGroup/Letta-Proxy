@@ -64,7 +64,6 @@ load_dotenv()
 LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
 LETTA_API_KEY = os.getenv("LETTA_API_KEY")
 REMOVE_SYSTEM_PROMPT = os.getenv("REMOVE_SYSTEM_PROMPT", "false").lower() == "true"
-# Force DEBUG_RAW_OUTPUT to true for now to diagnose newline issues
 DEBUG_RAW_OUTPUT = os.getenv("DEBUG_RAW_OUTPUT", "false").lower() == "true"
 DEBUG_OUTPUT_FILE = "letta_proxy_debug.txt"
 
@@ -264,18 +263,31 @@ async def startup_event() -> None:
     # Validate configuration
     validate_configuration()
 
-    # Configure client with API key if provided
-    client_kwargs = {"base_url": LETTA_BASE_URL}
-    if LETTA_API_KEY:
-        # For Letta Cloud, use token and project
-        if "letta.com" in LETTA_BASE_URL:
-            client_kwargs.update({
-                "token": LETTA_API_KEY,
-                "project": os.getenv("LETTA_PROJECT", "default-project")
-            })
-        else:
-            # For local servers, API key might be used differently
+    # Log configuration values for debugging
+    logger.info(f"Configuration loaded - LETTA_BASE_URL: {LETTA_BASE_URL}")
+    logger.info(f"Configuration loaded - LETTA_API_KEY: {'***' + LETTA_API_KEY[-4:] if LETTA_API_KEY else 'None'}")
+    logger.info(f"Configuration loaded - REMOVE_SYSTEM_PROMPT: {REMOVE_SYSTEM_PROMPT}")
+    logger.info(f"Configuration loaded - LETTA_PROJECT: {os.getenv('LETTA_PROJECT', 'default-project')}")
+
+    # Configure client - choose based on base_url setting
+    if LETTA_BASE_URL and LETTA_BASE_URL != "http://localhost:8283":
+        # Custom base_url specified - use it (could be custom server or specific cloud URL)
+        logger.info(f"Configuring for custom server - base_url: {LETTA_BASE_URL}")
+        client_kwargs = {"base_url": LETTA_BASE_URL}
+        if LETTA_API_KEY:
             client_kwargs["token"] = LETTA_API_KEY
+    else:
+        # No custom base_url - use cloud mode if API key present, otherwise local default
+        if LETTA_API_KEY:
+            project_name = os.getenv("LETTA_PROJECT")
+            logger.info(f"Configuring for Letta Cloud (no base_url) - project: {project_name or 'default'}")
+            client_kwargs = {
+                "token": LETTA_API_KEY,
+                "project": project_name  # None means default project
+            }
+        else:
+            logger.info(f"Configuring for local server - base_url: {LETTA_BASE_URL}")
+            client_kwargs = {"base_url": LETTA_BASE_URL}
 
     # Debug: Check if the URL scheme is causing issues
     print(f"Creating Letta client with base_url: {LETTA_BASE_URL}")
@@ -287,11 +299,12 @@ async def startup_event() -> None:
 
     try:
         agents = await client.agents.list()
+        agent_names = [agent.name for agent in agents]
         agent_map = {
             agent.name: AgentDescriptor(agent_id=agent.id, project_id=getattr(agent, "project_id", None))
             for agent in agents
         }
-        logger.info(f"Connected to Letta server. Found {len(agents)} agents.")
+        logger.info(f"Connected to Letta server. Found {len(agents)} agents: {agent_names}")
     except Exception as e:
         logger.warning(f"Could not connect to Letta server on startup: {e}")
         logger.warning("Agent list will be populated on first request")
@@ -549,31 +562,18 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                     stream_tokens=True
                 ):
                     # Handle tool calls - preserve our tool functionality
-                    if hasattr(event, 'message_type') and event.message_type == 'tool_call_message':
-                        chunk_resp = StreamingChunk(
-                            id=resp_id,
-                            object="chat.completion.chunk",
-                            created=int(time.time()),
-                            model=body.model,
-                            choices=[Choice(
-                                index=0,
-                                delta=Delta(
-                                    content="",
-                                    tool_calls=[{
-                                        "index": 0,
-                                        "id": event.tool_call.tool_call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": event.tool_call.name,
-                                            "arguments": event.tool_call.arguments,
-                                        },
-                                    }]
-                                )
-                            )]
-                        )
-                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
-                        continue
-                    elif isinstance(event, ToolCallMessage):
+                    # V1 compatibility: Check for both legacy and structured events
+                    event_type = None
+                    if hasattr(event, 'message_type') and isinstance(event.message_type, str):
+                        event_type = event.message_type
+                    elif hasattr(event, 'tool_call'):
+                        event_type = 'tool_call_message'
+                    elif hasattr(event, 'content'):
+                        event_type = 'assistant_message'
+                    elif hasattr(event, 'reasoning'):
+                        event_type = 'reasoning_message'
+                    
+                    if event_type == 'tool_call_message':
                         chunk_resp = StreamingChunk(
                             id=resp_id,
                             object="chat.completion.chunk",
@@ -599,24 +599,23 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                         continue
                         
                     # Extract content from various event types - convert to simple strings
+                    # V1 compatibility: Extract content based on event type
                     chunk_content = ""
-                    if hasattr(event, 'message_type') and event.message_type == 'assistant_message':
-                        chunk_content = event.content or ""
+                    if event_type == 'assistant_message':
+                        content = getattr(event, 'content', '') or ""
+                        # V1 compatibility: Extract text from TextContent objects
+                        if isinstance(content, list):
+                            chunk_content = "".join(item.text for item in content if hasattr(item, 'text'))
+                        else:
+                            chunk_content = content  # Fallback for older format
+                    elif event_type == 'reasoning_message':
+                        chunk_content = getattr(event, 'reasoning', '') or ""
                         if DEBUG_RAW_OUTPUT:
                             write_debug_output(f"RAW LETTA CONTENT: {repr(chunk_content)}", "LETTA_RAW")
                             write_debug_output(f"AFTER UNESCAPE: {repr(unescape_content(chunk_content))}", "AFTER_UNESCAPE")
                         # Use stateful processor for streaming-aware newline reconstruction
                         chunk_content = process_streaming_chunk(session_id, chunk_content)
-                    elif isinstance(event, AssistantMessage):
-                        chunk_content = event.content or ""
-                        if DEBUG_RAW_OUTPUT:
-                            write_debug_output(f"RAW LETTA CONTENT (legacy): {repr(chunk_content)}", "LETTA_RAW_LEGACY")
-                        # Use stateful processor for streaming-aware newline reconstruction
-                        chunk_content = process_streaming_chunk(session_id, chunk_content)
-                    elif hasattr(event, 'message_type') and event.message_type == 'reasoning_message':
-                        # Skip reasoning or include it - up to you
-                        continue
-                    elif hasattr(event, 'message_type') and event.message_type == 'stop_reason':
+                    elif event_type == 'stop_reason':
                         # Send final chunk
                         final_chunk = StreamingChunk(
                             id=resp_id,
