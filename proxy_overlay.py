@@ -44,8 +44,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from letta_client import AsyncLetta, MessageCreate
-from letta_client.types import TextContent
+from letta_client import AsyncLetta
+from letta_compat import MessageCreate, TextContent
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +312,8 @@ class ProxyOverlayManager:
                 logger.info(f"Successfully updated block {state.block_id}")
             else:
                 # Check if a block with this label already exists for this agent
-                existing_blocks = await self._client.agents.blocks.list(agent_id)
+                existing_blocks_page = await self._client.agents.blocks.list(agent_id)
+                existing_blocks = [block async for block in existing_blocks_page]
                 overlay_block = None
 
                 # Look for existing block with our overlay label
@@ -381,7 +382,7 @@ class ProxyOverlayManager:
                 fallback_messages.append(
                     MessageCreate(
                         role="user",
-                        content=[TextContent(text=f"[Proxy System Overlay]: {system_content}")],
+                        content=f"[Proxy System Overlay]: {system_content}",
                     )
                 )
                 state.fallback_applied = True

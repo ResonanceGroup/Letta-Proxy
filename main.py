@@ -26,6 +26,8 @@ Author: Jason Owens
 Version: 1.0.0
 """
 
+import ast
+import asyncio
 import json
 import os
 import time
@@ -39,10 +41,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
-from letta_client import AsyncLetta, MessageCreate
-from letta_client.types import (
-    AssistantMessage,
+from letta_client import AsyncLetta
+from letta_compat import (
+    MessageCreate,
     TextContent,
+    AssistantMessage,
     ToolCallMessage,
     ToolReturnMessage,
 )
@@ -166,6 +169,64 @@ def _normalize_content(content: Any) -> str:
     return str(content)
 
 
+def _openai_tools_to_client_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OpenAI tool definitions to Letta client_tools format.
+
+    OpenAI format:
+        {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
+    Letta client_tools format:
+        {"name": "...", "description": "...", "parameters": {...}}
+    """
+    client_tools = []
+    for tool in tools:
+        func = tool.get("function", {})
+        client_tool: Dict[str, Any] = {"name": func.get("name", "")}
+        if func.get("description"):
+            client_tool["description"] = func["description"]
+        if func.get("parameters"):
+            client_tool["parameters"] = func["parameters"]
+        client_tools.append(client_tool)
+    return client_tools
+
+
+def _build_tool_return_messages(
+    tool_results_parts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build Letta tool_return messages from OpenAI-style tool result messages.
+
+    Uses the MessageToolReturnCreate format — the preferred way to send tool results
+    back after client-side tool execution.
+
+    Args:
+        tool_results_parts: List of dicts with keys:
+            tool_call_id, content (the tool result payload)
+    """
+    tool_returns = []
+    for part in tool_results_parts:
+        tool_returns.append({
+            "type": "tool",
+            "status": "success",
+            "tool_call_id": part.get("tool_call_id", ""),
+            "tool_return": part.get("content", ""),
+        })
+    return [{"type": "tool_return", "tool_returns": tool_returns}]
+
+
+def _parse_proxy_tool_return(tool_return: Any) -> Optional[Dict[str, Any]]:
+    """Parse a proxy tool return payload back into a dict if present."""
+    data = tool_return
+    if isinstance(data, str):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                data = parser(data)
+                break
+            except Exception:
+                continue
+    if isinstance(data, dict) and data.get("type") == "proxy_tool_call":
+        return data
+    return None
+
+
 def _collect_system_content(messages: List[Dict[str, Any]]) -> Optional[str]:
     """Extract and combine all system messages from the request.
 
@@ -280,14 +341,14 @@ async def startup_event() -> None:
         logger.info(f"Configuring for custom server - base_url: {LETTA_BASE_URL}")
         client_kwargs = {"base_url": LETTA_BASE_URL}
         if LETTA_API_KEY:
-            client_kwargs["token"] = LETTA_API_KEY
+            client_kwargs["api_key"] = LETTA_API_KEY
     else:
         # No custom base_url - use cloud mode if API key present, otherwise local default
         if LETTA_API_KEY:
             project_name = os.getenv("LETTA_PROJECT")
             logger.info(f"Configuring for Letta Cloud (no base_url) - project: {project_name or 'default'}")
             client_kwargs = {
-                "token": LETTA_API_KEY,
+                "api_key": LETTA_API_KEY,
                 "project": project_name  # None means default project
             }
         else:
@@ -303,7 +364,8 @@ async def startup_event() -> None:
     client = AsyncLetta(**client_kwargs)
 
     try:
-        agents = await client.agents.list()
+        agents_page = await client.agents.list()
+        agents = [agent async for agent in agents_page]
         agent_names = [agent.name for agent in agents]
         agent_map = {
             agent.name: AgentDescriptor(agent_id=agent.id, project_id=getattr(agent, "project_id", None))
@@ -341,7 +403,8 @@ async def list_models() -> Dict[str, Any]:
     Returns:
         OpenAI-compatible response with list of available models/agents
     """
-    agents = await client.agents.list()
+    agents_page = await client.agents.list()
+    agents = [agent async for agent in agents_page]
     data = [
         {
             "id": agent.name,
@@ -464,60 +527,61 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         agent_id, session_id, system_content, project_id=agent_info.project_id
     )
 
-    # Prepare tool return messages from tool_results or trailing tool messages
-    tool_return_messages: List[MessageCreate] = []
-    seen_tool_call_ids = set()
+    # Collect tool results from explicit tool_results field and trailing tool messages.
+    # Tool results are sent back to Letta as approval messages (the proper SDK mechanism).
+    tool_result_items: List[Dict[str, Any]] = []
+    seen_tool_call_ids: set = set()
     if body.tool_results:
         for tool_result in body.tool_results:
-            tool_call_id = tool_result.get("tool_call_id")
+            tool_call_id = tool_result.get("tool_call_id", "")
             seen_tool_call_ids.add(tool_call_id)
             tool_payload = tool_result.get("result", "")
-            tool_return_messages.append(
-                MessageCreate(
-                    role="tool",
-                    content=[TextContent(text=json.dumps(tool_payload))],
-                    tool_call_id=tool_call_id,
-                )
-            )
+            payload_str = json.dumps(tool_payload) if not isinstance(tool_payload, str) else tool_payload
+            tool_result_items.append({"tool_call_id": tool_call_id, "content": payload_str})
 
     for tool_msg in _extract_trailing_tool_messages(body.messages):
-        tool_call_id = tool_msg.get("tool_call_id")
+        tool_call_id = tool_msg.get("tool_call_id", "")
         if tool_call_id and tool_call_id in seen_tool_call_ids:
             continue
         tool_content = _normalize_content(tool_msg.get("content"))
-        tool_return_messages.append(
-            MessageCreate(
-                role="tool",
-                content=[TextContent(text=tool_content)],
-                tool_call_id=tool_call_id,
-            )
-        )
+        tool_result_items.append({"tool_call_id": tool_call_id, "content": tool_content})
         if tool_call_id:
             seen_tool_call_ids.add(tool_call_id)
 
     latest_user_text = _extract_latest_user_message(body.messages)
-    user_messages_to_send: List[MessageCreate] = []
-    if latest_user_text is not None:
-        user_messages_to_send.append(
-            MessageCreate(role="user", content=[TextContent(text=latest_user_text)])
-        )
+    outbound_messages: list = [*fallback_messages]
 
-    # Compose full message payload in the correct order
-    outbound_messages = [*fallback_messages, *tool_return_messages, *user_messages_to_send]
+    if tool_result_items:
+        # Send tool results back using the SDK's MessageToolReturnCreate format.
+        # The server had paused waiting for client-side tool results; this resumes it.
+        tool_return_messages = _build_tool_return_messages(tool_result_items)
+        outbound_messages.extend(tool_return_messages)
+        # If there's also a user message, append it after the approvals
+        if latest_user_text:
+            outbound_messages.append(MessageCreate(role="user", content=latest_user_text))
+    elif latest_user_text is not None:
+        outbound_messages.append(MessageCreate(role="user", content=latest_user_text))
+
+    # When sending approval messages (tool results), skip the pre-send drain.
+    # The pending approval on the server IS the one we're about to respond to.
+    has_tool_results = bool(tool_result_items)
+
+    # Convert OpenAI tools to Letta client_tools format.
+    # Client tools are passed per-request; the server pauses the agent run when
+    # a client tool is called, and the client provides the result via an approval.
+    letta_client_tools: Optional[List[Dict[str, Any]]] = None
+    if body.tools:
+        letta_client_tools = _openai_tools_to_client_tools(body.tools)
+        logger.info(f"Passing {len(letta_client_tools)} client tools to agent {agent_id}")
 
     logger.info(
-        "Forwarding to Letta agent=%s session=%s overlay_changed=%s new_user_messages=%d stream=%s",
+        "Forwarding to Letta agent=%s session=%s overlay_changed=%s new_outbound=%d stream=%s",
         body.model,
         session_id,
         overlay_changed,
-        len(user_messages_to_send),
+        len(outbound_messages),
         body.stream,
     )
-
-    if body.tools:
-        proxy_bridge = get_proxy_bridge()
-        await proxy_bridge.sync_agent_tools(agent_id, body.tools)
-        logger.info(f"Synced {len(body.tools)} tools with agent {agent_id}")
 
     if body.stream and not outbound_messages:
         async def empty_stream():
@@ -560,12 +624,18 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
 
         async def stream_chunks():
             """Convert Letta streaming events to string chunks like reference implementation"""
+            # Buffer to accumulate tool_call_message deltas so we can reconstruct
+            # full arguments when the approval_request_message arrives.
+            # Key: tool_call_id, Value: {"name": str, "arguments": str}
+            pending_tool_calls: Dict[str, Dict[str, str]] = {}
             try:
                 async for event in stream_messages(
                     client,
                     agent_id,
                     outbound_messages,
                     stream_tokens=True,
+                    client_tools=letta_client_tools,
+                    pre_drain=not has_tool_results,
                 ):
                     # Handle tool calls - preserve our tool functionality
                     # V1 compatibility: Check for both legacy and structured events
@@ -574,39 +644,172 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                         event_type = event.message_type
                     elif hasattr(event, 'tool_call'):
                         event_type = 'tool_call_message'
+                    elif hasattr(event, 'tool_return'):
+                        event_type = 'tool_return_message'
                     elif hasattr(event, 'content'):
                         event_type = 'assistant_message'
                     elif hasattr(event, 'reasoning'):
                         event_type = 'reasoning_message'
-                    
+
+                    # Client tools: the server pauses and sends an approval_request_message
+                    # containing the tool call(s) the agent wants to execute.  We translate
+                    # this into an OpenAI tool_calls delta for the client.
+                    if event_type == 'approval_request_message':
+                        tool_calls_out = []
+                        # May have a single tool_call or a list in tool_calls
+                        tc_list = getattr(event, 'tool_calls', None)
+                        tc_single = getattr(event, 'tool_call', None)
+                        if tc_list and isinstance(tc_list, list):
+                            items = tc_list
+                        elif tc_single:
+                            items = [tc_single]
+                        else:
+                            items = []
+
+                        # Check if any tool call has null arguments (streaming ToolCallDelta).
+                        # If so, fetch the full message from the server to get real arguments.
+                        has_null_args = any(getattr(tc, 'arguments', None) is None for tc in items)
+                        if has_null_args:
+                            event_msg_id = getattr(event, 'id', None)
+                            # Fetch the full approval_request from the REST API to get
+                            # real arguments (streaming ToolCallDelta has arguments=None).
+                            # Retry with brief delays since there can be a small race
+                            # between the streaming event and REST API availability.
+                            for attempt in range(3):
+                                try:
+                                    if attempt > 0:
+                                        await asyncio.sleep(0.3 * attempt)
+                                    recent_msgs = await client.agents.messages.list(
+                                        agent_id=agent_id, limit=20
+                                    )
+                                    found = False
+                                    async for msg in recent_msgs:
+                                        if getattr(msg, 'message_type', None) != 'approval_request_message':
+                                            continue
+                                        msg_id = getattr(msg, 'id', None)
+                                        if event_msg_id and msg_id != event_msg_id:
+                                            continue
+                                        full_tc_list = getattr(msg, 'tool_calls', None)
+                                        full_tc_single = getattr(msg, 'tool_call', None)
+                                        if full_tc_list and isinstance(full_tc_list, list):
+                                            items = full_tc_list
+                                        elif full_tc_single:
+                                            items = [full_tc_single]
+                                        logger.info("Fetched full tool call args from server (msg_id=%s, attempt=%d)", msg_id, attempt+1)
+                                        found = True
+                                        break
+                                    if found:
+                                        break
+                                except Exception as fetch_err:
+                                    logger.warning("Failed to fetch tool call args (attempt=%d): %s", attempt+1, fetch_err)
+                            else:
+                                logger.warning("Could not find approval_request msg_id=%s after retries", event_msg_id)
+
+                        for idx, tc in enumerate(items):
+                            tc_id = getattr(tc, 'tool_call_id', None) or getattr(tc, 'id', f"call_{idx}")
+                            tc_name = getattr(tc, 'name', None) or ''
+                            tc_args_raw = getattr(tc, 'arguments', None)
+                            # In streaming, arguments may be None on the ToolCallDelta.
+                            # Fall back to buffered tool_call_message deltas, then to '{}'.
+                            if tc_args_raw is not None:
+                                tc_args = tc_args_raw
+                            elif tc_id in pending_tool_calls:
+                                tc_args = pending_tool_calls[tc_id].get("arguments", "{}")
+                                if not tc_name:
+                                    tc_name = pending_tool_calls[tc_id].get("name", "")
+                            else:
+                                tc_args = '{}'
+                            if not tc_name:
+                                tc_name = ''
+                            tool_calls_out.append({
+                                "index": idx,
+                                "id": tc_id,
+                                "type": "function",
+                                "function": {"name": tc_name, "arguments": tc_args},
+                            })
+                        if tool_calls_out:
+                            chunk_resp = StreamingChunk(
+                                id=resp_id,
+                                object="chat.completion.chunk",
+                                created=int(time.time()),
+                                model=body.model,
+                                choices=[Choice(
+                                    index=0,
+                                    delta=Delta(content="", tool_calls=tool_calls_out),
+                                )]
+                            )
+                            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+                            final_chunk = StreamingChunk(
+                                id=resp_id,
+                                object="chat.completion.chunk",
+                                created=int(time.time()),
+                                model=body.model,
+                                choices=[Choice(index=0, delta=Delta(content=""), finish_reason="tool_calls")]
+                            )
+                            yield f"data: {final_chunk.model_dump_json()}\n\n"
+                            return
+                        continue
+
+                    # Buffer tool_call_message deltas to reconstruct full arguments.
+                    # In streaming mode, the approval_request_message may arrive with
+                    # arguments=None; the actual arguments are in prior tool_call_message events.
                     if event_type == 'tool_call_message':
-                        chunk_resp = StreamingChunk(
-                            id=resp_id,
-                            object="chat.completion.chunk",
-                            created=int(time.time()),
-                            model=body.model,
-                            choices=[Choice(
-                                index=0,
-                                delta=Delta(
-                                    content="",
-                                    tool_calls=[{
-                                        "index": 0,
-                                        "id": event.tool_call.tool_call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": event.tool_call.name,
-                                            "arguments": event.tool_call.arguments,
-                                        },
-                                    }]
-                                )
-                            )]
-                        )
-                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
+                        tc_obj = getattr(event, 'tool_call', None)
+                        if tc_obj:
+                            tc_id = getattr(tc_obj, 'tool_call_id', None) or ''
+                            tc_name = getattr(tc_obj, 'name', None) or ''
+                            tc_args = getattr(tc_obj, 'arguments', None) or ''
+                            if tc_id not in pending_tool_calls:
+                                pending_tool_calls[tc_id] = {"name": tc_name, "arguments": tc_args}
+                            else:
+                                # Accumulate streaming argument deltas
+                                if tc_name:
+                                    pending_tool_calls[tc_id]["name"] = tc_name
+                                pending_tool_calls[tc_id]["arguments"] += tc_args
+                        continue
+
+                    if event_type == 'tool_return_message':
+                        # Legacy proxy tool path — still check for proxy_tool_call payloads
+                        # for backward compatibility with any server-side proxy tools.
+                        parsed_tool_call = _parse_proxy_tool_return(getattr(event, 'tool_return', None))
+                        if parsed_tool_call:
+                            chunk_resp = StreamingChunk(
+                                id=resp_id,
+                                object="chat.completion.chunk",
+                                created=int(time.time()),
+                                model=body.model,
+                                choices=[Choice(
+                                    index=0,
+                                    delta=Delta(
+                                        content="",
+                                        tool_calls=[{
+                                            "index": 0,
+                                            "id": parsed_tool_call.get("tool_call_id"),
+                                            "type": "function",
+                                            "function": {
+                                                "name": parsed_tool_call.get("function", {}).get("name"),
+                                                "arguments": parsed_tool_call.get("function", {}).get("arguments", "{}"),
+                                            },
+                                        }]
+                                    )
+                                )]
+                            )
+                            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+                            final_chunk = StreamingChunk(
+                                id=resp_id,
+                                object="chat.completion.chunk",
+                                created=int(time.time()),
+                                model=body.model,
+                                choices=[Choice(index=0, delta=Delta(content=""), finish_reason="tool_calls")]
+                            )
+                            yield f"data: {final_chunk.model_dump_json()}\n\n"
+                            return
                         continue
                         
-                    # Extract content from various event types - convert to simple strings
-                    # V1 compatibility: Extract content based on event type
+                    # Extract content from various event types and keep reasoning separate
                     chunk_content = ""
+                    chunk_reasoning = ""
                     if event_type == 'assistant_message':
                         content = getattr(event, 'content', '') or ""
                         # V1 compatibility: Extract text from TextContent objects
@@ -615,12 +818,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                         else:
                             chunk_content = content  # Fallback for older format
                     elif event_type == 'reasoning_message':
-                        chunk_content = getattr(event, 'reasoning', '') or ""
+                        chunk_reasoning = getattr(event, 'reasoning', '') or ""
                         if DEBUG_RAW_OUTPUT:
-                            write_debug_output(f"RAW LETTA CONTENT: {repr(chunk_content)}", "LETTA_RAW")
-                            write_debug_output(f"AFTER UNESCAPE: {repr(unescape_content(chunk_content))}", "AFTER_UNESCAPE")
+                            write_debug_output(f"RAW LETTA REASONING: {repr(chunk_reasoning)}", "LETTA_REASONING_RAW")
+                            write_debug_output(f"AFTER UNESCAPE: {repr(unescape_content(chunk_reasoning))}", "AFTER_UNESCAPE")
                         # Use stateful processor for streaming-aware newline reconstruction
-                        chunk_content = process_streaming_chunk(session_id, chunk_content)
+                        chunk_reasoning = process_streaming_chunk(session_id, chunk_reasoning)
                     elif event_type == 'stop_reason':
                         # Send final chunk
                         final_chunk = StreamingChunk(
@@ -634,19 +837,36 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                         return
                     else:
                         continue
-                        
-                    # Only process non-empty content - EXACT reference implementation
+
                     if chunk_content:
                         if not isinstance(chunk_content, str):
-                            logger.warning(f"Letta returned non-string chunk: {type(chunk_content)}. Converting to str.")
+                            logger.warning(f"Letta returned non-string assistant chunk: {type(chunk_content)}. Converting to str.")
                             chunk_content = str(chunk_content)
+
+                        if not chunk_content.strip():
+                            chunk_content = ""
+
+                        if chunk_content:
+                            chunk_resp = StreamingChunk(
+                                id=resp_id,
+                                object="chat.completion.chunk",
+                                created=int(time.time()),
+                                model=body.model,
+                                choices=[Choice(index=0, delta=Delta(content=chunk_content))]
+                            )
+                            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+                    if chunk_reasoning:
+                        if not isinstance(chunk_reasoning, str):
+                            logger.warning(f"Letta returned non-string reasoning chunk: {type(chunk_reasoning)}. Converting to str.")
+                            chunk_reasoning = str(chunk_reasoning)
 
                         chunk_resp = StreamingChunk(
                             id=resp_id,
                             object="chat.completion.chunk",
                             created=int(time.time()),
                             model=body.model,
-                            choices=[Choice(index=0, delta=Delta(content=chunk_content))]
+                            choices=[Choice(index=0, delta=Delta(content="", reasoning=chunk_reasoning))]
                         )
                         yield f"data: {chunk_resp.model_dump_json()}\n\n"
 
@@ -709,10 +929,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         }
         return Response(content=json.dumps(openai_resp, ensure_ascii=False), media_type="application/json")
 
-    resp = await send_messages(client, agent_id, outbound_messages)
+    resp = await send_messages(client, agent_id, outbound_messages, client_tools=letta_client_tools, pre_drain=not has_tool_results)
     assistant_messages: List[AssistantMessage] = []
     tool_calls: List[ToolCallMessage] = []
     tool_returns: List[ToolReturnMessage] = []
+    approval_requests: list = []
     for m in resp.messages:
         if isinstance(m, AssistantMessage):
             assistant_messages.append(m)
@@ -720,12 +941,36 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
             tool_calls.append(m)
         elif isinstance(m, ToolReturnMessage):
             tool_returns.append(m)
+        elif hasattr(m, 'message_type') and getattr(m, 'message_type', None) == 'approval_request_message':
+            approval_requests.append(m)
 
     response_message: Dict[str, Any]
     finish_reason = "stop"
 
-    # Handle tool calls according to OpenAI API format
-    if tool_calls and not tool_returns and not assistant_messages:
+    # Client tools: server pauses and returns an ApprovalRequestMessage with the
+    # tool call(s) the agent wants to execute.  Translate to OpenAI tool_calls.
+    if approval_requests:
+        openai_tool_calls = []
+        idx = 0
+        for ar in approval_requests:
+            tc_list = getattr(ar, 'tool_calls', None)
+            tc_single = getattr(ar, 'tool_call', None)
+            items = tc_list if (tc_list and isinstance(tc_list, list)) else ([tc_single] if tc_single else [])
+            for tc in items:
+                tc_id = getattr(tc, 'tool_call_id', None) or getattr(tc, 'id', f"call_{idx}")
+                tc_name = getattr(tc, 'name', None) or getattr(tc, 'function', {}).get('name', '')
+                tc_args_raw = getattr(tc, 'arguments', None)
+                tc_args = tc_args_raw if tc_args_raw is not None else '{}'
+                openai_tool_calls.append({
+                    "index": idx,
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": tc_name, "arguments": tc_args},
+                })
+                idx += 1
+        response_message = {"role": "assistant", "content": "", "tool_calls": openai_tool_calls}
+        finish_reason = "tool_calls"
+    elif tool_calls and not tool_returns and not assistant_messages:
         response_message = {
             "role": "assistant",
             "content": "",
@@ -773,12 +1018,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
             "content": combined_content
         }
         
-        # If there's reasoning content, include it in the content for OpenAI compatibility
+        # Keep reasoning separate so clients can render it distinctly
         if reasoning_content:
-            if combined_content:
-                response_message["content"] = f"{combined_content}\n\n[Reasoning: {reasoning_content}]"
-            else:
-                response_message["content"] = reasoning_content
+            response_message["reasoning"] = reasoning_content
         
         # Debug: Log the final combined content
         if DEBUG_RAW_OUTPUT:

@@ -65,6 +65,7 @@ async def send_messages(
     messages: List[MessageCreate],
     *,
     pre_drain: bool = True,
+    client_tools: Optional[List[Any]] = None,
 ) -> Any:
     """Send messages to a Letta agent with automatic recovery.
 
@@ -75,6 +76,7 @@ async def send_messages(
         agent_id: The Letta agent ID.
         messages: List of MessageCreate objects to send.
         pre_drain: Whether to drain stale approvals before sending (default True).
+        client_tools: Optional list of client-side tool definitions (ClientTool dicts).
 
     Returns:
         The response from client.agents.messages.create().
@@ -94,11 +96,16 @@ async def send_messages(
     busy_retries = 0
     transient_retries = 0
 
+    extra_kwargs: dict = {}
+    if client_tools:
+        extra_kwargs["client_tools"] = client_tools
+
     while True:
         try:
             resp = await client.agents.messages.create(
                 agent_id=agent_id,
                 messages=messages,
+                **extra_kwargs,
             )
             return resp
 
@@ -160,6 +167,7 @@ async def stream_messages(
     *,
     pre_drain: bool = True,
     stream_tokens: bool = True,
+    client_tools: Optional[List[Any]] = None,
 ) -> AsyncGenerator:
     """Stream messages from a Letta agent with automatic recovery.
 
@@ -176,6 +184,7 @@ async def stream_messages(
         messages: List of MessageCreate objects to send.
         pre_drain: Whether to drain stale approvals before sending (default True).
         stream_tokens: Whether to stream individual tokens (default True).
+        client_tools: Optional list of client-side tool definitions (ClientTool dicts).
 
     Yields:
         Letta streaming events (same as create_stream).
@@ -195,6 +204,10 @@ async def stream_messages(
     busy_retries = 0
     transient_retries = 0
 
+    extra_kwargs: dict = {}
+    if client_tools:
+        extra_kwargs["client_tools"] = client_tools
+
     while True:
         try:
             # Support both SDK versions: .create_stream() (older) and .stream() (newer)
@@ -208,6 +221,7 @@ async def stream_messages(
                 agent_id=agent_id,
                 messages=messages,
                 stream_tokens=stream_tokens,
+                **extra_kwargs,
             )
 
             # If stream_fn returned a coroutine, await it to get the iterator
