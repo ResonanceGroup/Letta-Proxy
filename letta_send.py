@@ -197,11 +197,22 @@ async def stream_messages(
 
     while True:
         try:
-            stream = client.agents.messages.create_stream(
+            # Support both SDK versions: .create_stream() (older) and .stream() (newer)
+            # .create_stream() returns an async iterable directly
+            # .stream() returns a coroutine that resolves to an async iterable
+            stream_fn = getattr(client.agents.messages, "create_stream", None) or \
+                        getattr(client.agents.messages, "stream", None)
+            if stream_fn is None:
+                raise RuntimeError("Letta SDK has no streaming method (tried create_stream, stream)")
+            stream = stream_fn(
                 agent_id=agent_id,
                 messages=messages,
                 stream_tokens=stream_tokens,
             )
+
+            # If stream_fn returned a coroutine, await it to get the iterator
+            if hasattr(stream, "__await__") or asyncio.iscoroutine(stream):
+                stream = await stream
 
             # If we get here, the stream connection was established.
             # Yield events to the caller. Mid-stream errors are surfaced
