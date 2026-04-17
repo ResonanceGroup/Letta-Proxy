@@ -58,6 +58,7 @@ from streaming_models import (
     unescape_content
 )
 from streaming_content_processor import process_streaming_chunk, cleanup_streaming_session
+from letta_send import send_messages, stream_messages
 
 # Load environment variables from .env file
 load_dotenv()
@@ -560,10 +561,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         async def stream_chunks():
             """Convert Letta streaming events to string chunks like reference implementation"""
             try:
-                async for event in client.agents.messages.create_stream(
-                    agent_id=agent_id,
-                    messages=outbound_messages,
-                    stream_tokens=True
+                async for event in stream_messages(
+                    client,
+                    agent_id,
+                    outbound_messages,
+                    stream_tokens=True,
                 ):
                     # Handle tool calls - preserve our tool functionality
                     # V1 compatibility: Check for both legacy and structured events
@@ -707,7 +709,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
         }
         return Response(content=json.dumps(openai_resp, ensure_ascii=False), media_type="application/json")
 
-    resp = await client.agents.messages.create(agent_id=agent_id, messages=outbound_messages)
+    resp = await send_messages(client, agent_id, outbound_messages)
     assistant_messages: List[AssistantMessage] = []
     tool_calls: List[ToolCallMessage] = []
     tool_returns: List[ToolReturnMessage] = []
